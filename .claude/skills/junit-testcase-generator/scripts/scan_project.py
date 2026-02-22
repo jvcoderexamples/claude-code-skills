@@ -1,418 +1,265 @@
 #!/usr/bin/env python3
-"""
-Scan Maven Java project source folder and identify classes needing unit tests.
-Outputs JSON with class information for test generation.
+"""Scan Maven Java project source folder and identify classes needing unit tests.
+
+Stateless: reads source files, writes nothing. Output goes to stdout.
+
+Usage:
+  python3 scan_project.py [source_folder] [options]
+
+Arguments:
+  source_folder           Path to Java source folder (default: src/main/java)
+
+Options:
+  --test-folder <path>    Path to test folder (default: src/test/java)
+  --exclude <pattern>     Substring to exclude from relative file paths (repeatable)
+  --project-root <path>   Project root containing pom.xml (default: .)
+  --output <format>       json | summary | pending  (default: summary)
+
+Exit codes: 0 = success, 1 = error (missing pom.xml or source folder)
 """
 
-import argparse
 import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Optional, Set
-
-TRACKING_FILE = ".junit-generator-tracking.json"
 
 
-def check_maven_project(project_root: str) -> bool:
-    """Check if project is a Maven project."""
-    pom_path = Path(project_root) / "pom.xml"
-    return pom_path.exists()
+def main():
+    source_folder = "src/main/java"
+    test_folder = "src/test/java"
+    project_root = "."
+    output_format = "summary"
+    exclusions = []
 
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--test-folder":
+            test_folder = args[i + 1]; i += 2
+        elif a == "--exclude":
+            exclusions.append(args[i + 1]); i += 2
+        elif a == "--project-root":
+            project_root = args[i + 1]; i += 2
+        elif a == "--output":
+            output_format = args[i + 1]; i += 2
+        elif not a.startswith("--"):
+            source_folder = a; i += 1
+        else:
+            i += 1
 
-def check_maven_dependencies(project_root: str) -> Dict:
-    """Check if pom.xml has required test dependencies."""
     pom_path = Path(project_root) / "pom.xml"
     if not pom_path.exists():
+        print(f"Error: No pom.xml found at {project_root}. This skill requires a Maven project.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    deps = check_maven_dependencies(pom_path)
+    classes = scan_source_files(source_folder, test_folder, exclusions)
+
+    total         = len(classes)
+    pending_count = sum(1 for c in classes if c["status"] == "pending")
+    existing_count= sum(1 for c in classes if c["status"] == "existing")
+    with_static   = sum(1 for c in classes if c["hasStaticMethods"])
+    with_private  = sum(1 for c in classes if c["hasPrivateMethods"])
+
+    if output_format == "json":
+        print(json.dumps({
+            "scannedAt":          datetime.now(timezone.utc).isoformat(),
+            "sourceFolder":       source_folder,
+            "testFolder":         test_folder,
+            "buildTool":          "maven",
+            "mavenDependencies":  deps,
+            "summary": {
+                "totalClasses":      total,
+                "pending":           pending_count,
+                "existingTests":     existing_count,
+                "withStaticMethods": with_static,
+                "withPrivateMethods":with_private,
+            },
+            "classes": classes,
+        }, indent=2))
+
+    elif output_format == "pending":
+        pending = [c for c in classes if c["status"] == "pending"]
+        print(json.dumps(pending, indent=2))
+
+    else:  # summary
+        print("\n=== Maven Project Scan Results ===")
+        print(f"Project root:  {project_root}")
+        print(f"Source folder: {source_folder}")
+        print(f"Test folder:   {test_folder}")
+        print("\nMaven Dependencies:")
+        _yn = lambda ok, add: "Y" if ok else f"N  ({add})"
+        print(f"  JUnit 5:  {_yn(deps.get('hasJunit5'),  'add junit-jupiter to pom.xml')}")
+        print(f"  Mockito:  {_yn(deps.get('hasMockito'),  'add mockito-core to pom.xml')}")
+        print(f"  Surefire: {_yn(deps.get('hasSurefire'), 'add maven-surefire-plugin')}")
+        print(f"  JaCoCo:   {_yn(deps.get('hasJacoco'),   'add jacoco-maven-plugin')}")
+        print(f"\nClasses Found: {total}")
+        print(f"  Pending (no tests):   {pending_count}")
+        print(f"  With existing tests:  {existing_count}")
+        print(f"\nClasses with static methods:   {with_static}")
+        print(f"Classes with private methods:  {with_private}")
+        if pending_count > 0:
+            print("\nRun with --output pending to list classes needing tests.")
+            print("Run with --output json to get full class details.")
+
+
+# ---------------------------------------------------------------------------
+# Maven pom.xml inspection
+# ---------------------------------------------------------------------------
+
+def check_maven_dependencies(pom_path: Path) -> dict:
+    try:
+        content = pom_path.read_text(encoding="utf-8")
+        return {
+            "hasPom":      True,
+            "hasJunit5":   "junit-jupiter" in content,
+            "hasMockito":  "mockito-core" in content or "mockito-junit-jupiter" in content,
+            "hasSurefire": "maven-surefire-plugin" in content,
+            "hasJacoco":   "jacoco-maven-plugin" in content,
+        }
+    except OSError:
         return {"hasPom": False}
 
-    with open(pom_path, 'r', encoding='utf-8') as f:
-        content = f.read()
 
-    return {
-        "hasPom": True,
-        "hasJunit5": "junit-jupiter" in content,
-        "hasMockito": "mockito-core" in content or "mockito-junit-jupiter" in content,
-        "hasSurefire": "maven-surefire-plugin" in content
-    }
+# ---------------------------------------------------------------------------
+# Source folder walker
+# ---------------------------------------------------------------------------
 
-
-def load_tracking(project_root: str) -> Dict:
-    """Load existing tracking data."""
-    tracking_path = Path(project_root) / TRACKING_FILE
-    if tracking_path.exists():
-        with open(tracking_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {
-        "generated": [],
-        "pending": [],
-        "failed": {},
-        "lastRun": None,
-        "projectRoot": project_root
-    }
-
-
-def save_tracking(project_root: str, tracking: Dict) -> None:
-    """Save tracking data."""
-    tracking_path = Path(project_root) / TRACKING_FILE
-    tracking["lastRun"] = datetime.now().isoformat()
-    with open(tracking_path, 'w', encoding='utf-8') as f:
-        json.dump(tracking, f, indent=2)
-
-
-def extract_class_info(file_path: Path) -> Optional[Dict]:
-    """Extract class information from Java file."""
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-    except Exception as e:
-        return None
-
-    # Extract package
-    package_match = re.search(r'package\s+([\w.]+)\s*;', content)
-    package = package_match.group(1) if package_match else ""
-
-    # Extract class name (handle class, interface, enum, record)
-    class_match = re.search(
-        r'(?:public\s+)?(?:abstract\s+)?(?:final\s+)?'
-        r'(?:class|interface|enum|record)\s+(\w+)',
-        content
-    )
-    if not class_match:
-        return None
-
-    class_name = class_match.group(1)
-    full_class_name = f"{package}.{class_name}" if package else class_name
-
-    # Determine class type
-    class_type = "class"
-    if re.search(r'\binterface\s+' + class_name, content):
-        class_type = "interface"
-    elif re.search(r'\benum\s+' + class_name, content):
-        class_type = "enum"
-    elif re.search(r'\brecord\s+' + class_name, content):
-        class_type = "record"
-    elif re.search(r'\babstract\s+class\s+' + class_name, content):
-        class_type = "abstract"
-
-    # Extract methods
-    methods = extract_methods(content)
-
-    # Extract dependencies (fields with type annotations or constructor params)
-    dependencies = extract_dependencies(content)
-
-    return {
-        "filePath": str(file_path),
-        "package": package,
-        "className": class_name,
-        "fullClassName": full_class_name,
-        "classType": class_type,
-        "methods": methods,
-        "dependencies": dependencies,
-        "hasStaticMethods": any(m.get("isStatic") for m in methods),
-        "hasPrivateMethods": any(m.get("visibility") == "private" for m in methods)
-    }
-
-
-def extract_methods(content: str) -> List[Dict]:
-    """Extract method signatures from Java content."""
-    methods = []
-
-    # Pattern for method declarations
-    method_pattern = re.compile(
-        r'(?P<visibility>public|private|protected)?\s*'
-        r'(?P<static>static)?\s*'
-        r'(?P<final>final)?\s*'
-        r'(?P<returnType>[\w<>,\s\[\]]+)\s+'
-        r'(?P<name>\w+)\s*'
-        r'\((?P<params>[^)]*)\)\s*'
-        r'(?:throws\s+(?P<throws>[\w,\s]+))?\s*\{',
-        re.MULTILINE
-    )
-
-    for match in method_pattern.finditer(content):
-        # Skip constructors (return type same as method name typically doesn't happen)
-        method_name = match.group('name')
-        return_type = match.group('returnType').strip()
-
-        # Skip if it looks like a constructor
-        if return_type == method_name:
-            continue
-
-        methods.append({
-            "name": method_name,
-            "visibility": match.group('visibility') or "package-private",
-            "isStatic": bool(match.group('static')),
-            "isFinal": bool(match.group('final')),
-            "returnType": return_type,
-            "parameters": parse_parameters(match.group('params')),
-            "throws": [t.strip() for t in (match.group('throws') or "").split(",") if t.strip()]
-        })
-
-    return methods
-
-
-def parse_parameters(params_str: str) -> List[Dict]:
-    """Parse method parameters."""
-    if not params_str.strip():
-        return []
-
-    params = []
-    # Simple parsing - split by comma but handle generics
-    depth = 0
-    current = ""
-
-    for char in params_str:
-        if char in '<':
-            depth += 1
-        elif char in '>':
-            depth -= 1
-        elif char == ',' and depth == 0:
-            if current.strip():
-                params.append(parse_single_param(current.strip()))
-            current = ""
-            continue
-        current += char
-
-    if current.strip():
-        params.append(parse_single_param(current.strip()))
-
-    return params
-
-
-def parse_single_param(param: str) -> Dict:
-    """Parse a single parameter."""
-    parts = param.split()
-    if len(parts) >= 2:
-        # Handle annotations
-        annotations = [p for p in parts[:-2] if p.startswith('@')]
-        type_name = parts[-2]
-        param_name = parts[-1]
-        return {"type": type_name, "name": param_name, "annotations": annotations}
-    elif len(parts) == 2:
-        return {"type": parts[0], "name": parts[1], "annotations": []}
-    return {"type": param, "name": "unknown", "annotations": []}
-
-
-def extract_dependencies(content: str) -> List[Dict]:
-    """Extract class dependencies from fields and constructor."""
-    dependencies = []
-
-    # Field injection patterns (@Autowired, @Inject, etc.)
-    field_pattern = re.compile(
-        r'(?:@(?:Autowired|Inject|Mock|InjectMocks|Resource)\s+)?'
-        r'private\s+(?:final\s+)?(\w+(?:<[^>]+>)?)\s+(\w+)\s*[;=]'
-    )
-
-    for match in field_pattern.finditer(content):
-        dep_type = match.group(1)
-        dep_name = match.group(2)
-
-        # Skip primitive types and common Java types
-        if dep_type.lower() in ['int', 'long', 'double', 'float', 'boolean',
-                                 'string', 'integer', 'list', 'map', 'set']:
-            continue
-
-        dependencies.append({
-            "type": dep_type,
-            "name": dep_name
-        })
-
-    return dependencies
-
-
-def find_java_files(source_folder: str, exclusions: List[str] = None) -> List[Path]:
-    """Find all Java files in source folder."""
+def scan_source_files(source_folder: str, test_folder: str, exclusions: list) -> list:
     source_path = Path(source_folder)
     if not source_path.exists():
         print(f"Error: Source folder does not exist: {source_folder}", file=sys.stderr)
         sys.exit(1)
 
-    exclusions = exclusions or []
-    java_files = []
-
-    for java_file in source_path.rglob("*.java"):
-        # Check exclusions
-        relative_path = str(java_file.relative_to(source_path))
-        skip = False
-
-        for pattern in exclusions:
-            if pattern in relative_path:
-                skip = True
-                break
-
-        if not skip:
-            java_files.append(java_file)
-
-    return java_files
-
-
-def check_existing_test(class_info: Dict, test_folder: str) -> bool:
-    """Check if test already exists for a class."""
-    if not test_folder:
-        return False
-
-    test_path = Path(test_folder)
-    package_path = class_info["package"].replace(".", os.sep)
-    test_file = test_path / package_path / f"{class_info['className']}Test.java"
-
-    return test_file.exists()
-
-
-def scan_project(
-    source_folder: str,
-    test_folder: str = None,
-    exclusions: List[str] = None,
-    project_root: str = None
-) -> Dict:
-    """Scan Maven project and return analysis results."""
-
-    project_root = project_root or str(Path(source_folder).parent.parent)
-
-    # Check Maven project
-    if not check_maven_project(project_root):
-        return {
-            "status": "error",
-            "message": f"No pom.xml found at {project_root}. This skill requires a Maven project."
-        }
-
-    # Check Maven dependencies
-    deps = check_maven_dependencies(project_root)
-
-    tracking = load_tracking(project_root)
-    tracking["mavenDependencies"] = deps
-
-    # Find Java files
-    java_files = find_java_files(source_folder, exclusions)
-
-    # Analyze each file
     classes = []
-    for java_file in java_files:
-        class_info = extract_class_info(java_file)
-        if class_info:
-            # Skip interfaces (usually no tests needed)
-            if class_info["classType"] == "interface":
-                continue
+    for java_file in sorted(source_path.rglob("*.java")):
+        relative = str(java_file.relative_to(source_path))
 
-            # Check if already generated
-            if class_info["fullClassName"] in tracking["generated"]:
-                class_info["status"] = "generated"
-            elif check_existing_test(class_info, test_folder):
-                class_info["status"] = "existing"
-                tracking["generated"].append(class_info["fullClassName"])
-            elif class_info["fullClassName"] in tracking.get("failed", {}):
-                class_info["status"] = "failed"
-                class_info["failureReason"] = tracking["failed"][class_info["fullClassName"]]
-            else:
-                class_info["status"] = "pending"
+        # Skip excluded paths (substring match on relative path)
+        if any(exc in relative for exc in exclusions):
+            continue
 
-            classes.append(class_info)
+        # Skip package-info and module-info
+        if java_file.stem in ("package-info", "module-info"):
+            continue
 
-    # Update pending list
-    pending = [c["fullClassName"] for c in classes if c["status"] == "pending"]
-    tracking["pending"] = pending
+        info = extract_class_info(java_file)
+        if info is None:
+            continue
 
-    # Save tracking
-    save_tracking(project_root, tracking)
+        # Skip pure interfaces (no tests needed beyond integration)
+        if info["classType"] == "interface":
+            continue
 
-    # Summary
-    summary = {
-        "totalClasses": len(classes),
-        "pending": len([c for c in classes if c["status"] == "pending"]),
-        "generated": len([c for c in classes if c["status"] in ["generated", "existing"]]),
-        "failed": len([c for c in classes if c["status"] == "failed"]),
-        "withStaticMethods": len([c for c in classes if c.get("hasStaticMethods")]),
-        "withPrivateMethods": len([c for c in classes if c.get("hasPrivateMethods")])
-    }
+        # Resolve expected test file
+        pkg_dir = info["package"].replace(".", os.sep) if info["package"] else ""
+        test_file_path = Path(test_folder) / pkg_dir / f"{info['className']}Test.java"
+        test_file_str  = str(test_file_path).replace(os.sep, "/")
+
+        info["testFile"]      = test_file_str
+        info["testFileExists"]= test_file_path.exists()
+        info["status"]        = "existing" if info["testFileExists"] else "pending"
+
+        classes.append(info)
+
+    return classes
+
+
+# ---------------------------------------------------------------------------
+# Class-level Java parser (regex-based, no external deps)
+# ---------------------------------------------------------------------------
+
+def extract_class_info(file_path: Path) -> dict | None:
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    # Package
+    m = re.search(r"package\s+([\w.]+)\s*;", content)
+    package = m.group(1) if m else ""
+
+    # Primary type declaration
+    m = re.search(
+        r"(?:public\s+)?(?:abstract\s+)?(?:final\s+)?"
+        r"(?:class|interface|enum|record)\s+(\w+)",
+        content,
+    )
+    if not m:
+        return None
+    class_name     = m.group(1)
+    full_class_name = f"{package}.{class_name}" if package else class_name
+
+    # Classify type
+    class_type = "class"
+    if   re.search(rf"\binterface\s+{re.escape(class_name)}", content): class_type = "interface"
+    elif re.search(rf"\benum\s+{re.escape(class_name)}",      content): class_type = "enum"
+    elif re.search(rf"\brecord\s+{re.escape(class_name)}",    content): class_type = "record"
+    elif re.search(rf"\babstract\s+class\s+{re.escape(class_name)}", content): class_type = "abstract"
+
+    methods      = extract_methods(content, class_name)
+    dependencies = extract_dependencies(content)
+    has_static   = any(m2.get("isStatic") for m2 in methods)
+    has_private  = any(m2.get("visibility") == "private" for m2 in methods)
 
     return {
-        "buildTool": "maven",
-        "mavenDependencies": deps,
-        "summary": summary,
-        "classes": classes,
-        "tracking": tracking
+        "filePath":          str(file_path).replace(os.sep, "/"),
+        "package":           package,
+        "className":         class_name,
+        "fullClassName":     full_class_name,
+        "classType":         class_type,
+        "methods":           methods,
+        "dependencies":      dependencies,
+        "hasStaticMethods":  has_static,
+        "hasPrivateMethods": has_private,
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Scan Maven Java project for test generation"
+def extract_methods(content: str, class_name: str) -> list:
+    pattern = re.compile(
+        r"(?P<visibility>public|private|protected)?\s*"
+        r"(?P<static>static)?\s*"
+        r"(?P<final>final)?\s*"
+        r"(?P<returnType>[\w<>,\s\[\]]+)\s+"
+        r"(?P<name>\w+)\s*"
+        r"\((?P<params>[^)]*)\)\s*"
+        r"(?:throws\s+(?P<throws>[\w,\s]+))?\s*\{",
+        re.MULTILINE,
     )
-    parser.add_argument(
-        "source_folder",
-        nargs="?",
-        default="src/main/java",
-        help="Path to Java source folder (default: src/main/java)"
-    )
-    parser.add_argument(
-        "--test-folder",
-        default="src/test/java",
-        help="Path to test folder (default: src/test/java)"
-    )
-    parser.add_argument(
-        "--exclude",
-        action="append",
-        default=[],
-        help="Patterns to exclude (can be repeated)"
-    )
-    parser.add_argument(
-        "--project-root",
-        default=".",
-        help="Project root directory containing pom.xml (default: current directory)"
-    )
-    parser.add_argument(
-        "--output",
-        choices=["json", "summary", "pending"],
-        default="summary",
-        help="Output format"
-    )
+    methods = []
+    for m in pattern.finditer(content):
+        method_name = m.group("name")
+        return_type = (m.group("returnType") or "").strip()
+        if return_type == method_name:
+            continue  # constructor
+        throws_str = m.group("throws") or ""
+        methods.append({
+            "name":       method_name,
+            "visibility": m.group("visibility") or "package-private",
+            "isStatic":   m.group("static") is not None,
+            "isFinal":    m.group("final")  is not None,
+            "returnType": return_type,
+            "throws":     [t.strip() for t in throws_str.split(",") if t.strip()],
+        })
+    return methods
 
-    args = parser.parse_args()
 
-    results = scan_project(
-        source_folder=args.source_folder,
-        test_folder=args.test_folder,
-        exclusions=args.exclude,
-        project_root=args.project_root
-    )
-
-    # Handle error case
-    if results.get("status") == "error":
-        print(f"Error: {results.get('message')}")
-        sys.exit(1)
-
-    if args.output == "json":
-        print(json.dumps(results, indent=2))
-    elif args.output == "pending":
-        # Output only pending classes for processing
-        pending = [c for c in results["classes"] if c["status"] == "pending"]
-        print(json.dumps(pending, indent=2))
-    else:
-        # Summary output
-        s = results["summary"]
-        deps = results["tracking"].get("mavenDependencies", {})
-
-        print(f"\n=== Maven Project Scan Results ===")
-        print(f"Project root: {args.project_root}")
-        print(f"Source folder: {args.source_folder}")
-
-        # Maven dependencies status
-        print(f"\nMaven Dependencies:")
-        print(f"  JUnit 5:  {'✓' if deps.get('hasJunit5') else '✗ (add junit-jupiter to pom.xml)'}")
-        print(f"  Mockito:  {'✓' if deps.get('hasMockito') else '✗ (add mockito-core to pom.xml)'}")
-        print(f"  Surefire: {'✓' if deps.get('hasSurefire') else '✗ (add maven-surefire-plugin)'}")
-
-        print(f"\nClasses Found: {s['totalClasses']}")
-        print(f"  Pending:   {s['pending']}")
-        print(f"  Generated: {s['generated']}")
-        print(f"  Failed:    {s['failed']}")
-        print(f"\nClasses with static methods:  {s['withStaticMethods']}")
-        print(f"Classes with private methods: {s['withPrivateMethods']}")
-
-        if s['pending'] > 0:
-            print(f"\nRun with --output pending to get list of classes needing tests")
+def extract_dependencies(content: str) -> list:
+    skip = {
+        "int", "long", "double", "float", "boolean",
+        "String", "Integer", "Long", "Double", "Float", "Boolean",
+        "List", "Map", "Set", "Optional",
+    }
+    deps = []
+    for m in re.finditer(r"private\s+(?:final\s+)?([\w]+(?:<[^>]+>)?)\s+(\w+)\s*[;=]", content):
+        t, n = m.group(1), m.group(2)
+        if t not in skip and t.lower() not in {s.lower() for s in skip}:
+            deps.append({"type": t, "name": n})
+    return deps
 
 
 if __name__ == "__main__":

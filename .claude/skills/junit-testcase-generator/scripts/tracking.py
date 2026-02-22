@@ -1,285 +1,320 @@
 #!/usr/bin/env python3
-"""
-Manage test generation tracking file.
-Supports status checks, manual updates, and reset operations.
+"""Manage .junit-progress.json for the junit-testcase-generator skill.
+
+Works with the skill's canonical per-class schema (status, retryCount, errorHistory).
+
+Usage:
+  python3 tracking.py <command> [options]
+
+Commands:
+  status                       Print progress summary table
+  init                         Create/reset .junit-progress.json from scan JSON
+                               (reads scan_project.py --output json from stdin or --scan-file)
+  mark <class> <status>        Set a class's status:
+                                 pending | in_progress | completed | failed | needs_manual_review
+  next [--batch <n>]           Print next N in_progress/pending class names (default: 5)
+  reset [--target <t>]         Reset classes back to pending:
+                                 all | failed | in_progress  (default: all)
+  export                       Print full .junit-progress.json to stdout
+
+Options:
+  --project-root <path>        Project root directory (default: .)
+  --scan-file <path>           JSON file from scan_project.py (for init)
+  --source-folder <path>       Source folder (for init when not in scan output)
+  --test-folder <path>         Test folder (for init when not in scan output)
+  --batch <n>                  Batch size for next command
+  --target <t>                 Reset target
+  --reason <text>              Error summary (for mark failed/needs_manual_review)
+  --coverage <line%:branch%>   Coverage string to record (e.g. "100%:100%")
+
+Exit codes: 0 = success, 1 = error
 """
 
-import argparse
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
 
-TRACKING_FILE = ".junit-generator-tracking.json"
-
-
-def load_tracking(project_root: str) -> Optional[Dict]:
-    """Load tracking data from file."""
-    tracking_path = Path(project_root) / TRACKING_FILE
-    if not tracking_path.exists():
-        return None
-
-    with open(tracking_path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+PROGRESS_FILE = ".junit-progress.json"
 
 
-def save_tracking(project_root: str, tracking: Dict) -> None:
-    """Save tracking data to file."""
-    tracking_path = Path(project_root) / TRACKING_FILE
-    tracking["lastUpdated"] = datetime.now().isoformat()
-
-    with open(tracking_path, 'w', encoding='utf-8') as f:
-        json.dump(tracking, f, indent=2)
-
-
-def init_tracking(project_root: str) -> Dict:
-    """Initialize a new tracking file."""
-    tracking = {
-        "generated": [],
-        "pending": [],
-        "failed": {},
-        "lastRun": None,
-        "lastUpdated": datetime.now().isoformat(),
-        "projectRoot": project_root
-    }
-    save_tracking(project_root, tracking)
-    return tracking
-
-
-def show_status(project_root: str) -> None:
-    """Display tracking status."""
-    tracking = load_tracking(project_root)
-
-    if not tracking:
-        print(f"No tracking file found at {project_root}/{TRACKING_FILE}")
-        print("Run 'scan_project.py' first to initialize tracking.")
-        return
-
-    print(f"\n=== JUnit Generator Tracking Status ===")
-    print(f"Project: {tracking.get('projectRoot', 'N/A')}")
-    print(f"Last run: {tracking.get('lastRun', 'Never')}")
-    print(f"Last updated: {tracking.get('lastUpdated', 'N/A')}")
-
-    generated = tracking.get('generated', [])
-    pending = tracking.get('pending', [])
-    failed = tracking.get('failed', {})
-
-    print(f"\nProgress:")
-    print(f"  Generated: {len(generated)}")
-    print(f"  Pending:   {len(pending)}")
-    print(f"  Failed:    {len(failed)}")
-
-    total = len(generated) + len(pending) + len(failed)
-    if total > 0:
-        pct = (len(generated) / total) * 100
-        print(f"  Progress:  {pct:.1f}%")
-
-    if pending:
-        print(f"\nNext classes to generate (first 10):")
-        for cls in pending[:10]:
-            print(f"  - {cls}")
-        if len(pending) > 10:
-            print(f"  ... and {len(pending) - 10} more")
-
-    if failed:
-        print(f"\nFailed classes:")
-        for cls, reason in list(failed.items())[:5]:
-            print(f"  - {cls}: {reason[:60]}")
-
-
-def mark_generated(project_root: str, class_names: List[str]) -> None:
-    """Mark classes as having tests generated."""
-    tracking = load_tracking(project_root)
-    if not tracking:
-        tracking = init_tracking(project_root)
-
-    for cls in class_names:
-        if cls not in tracking["generated"]:
-            tracking["generated"].append(cls)
-
-        if cls in tracking["pending"]:
-            tracking["pending"].remove(cls)
-
-        if cls in tracking.get("failed", {}):
-            del tracking["failed"][cls]
-
-    save_tracking(project_root, tracking)
-    print(f"Marked {len(class_names)} class(es) as generated")
-
-
-def mark_failed(project_root: str, class_name: str, reason: str) -> None:
-    """Mark a class as failed."""
-    tracking = load_tracking(project_root)
-    if not tracking:
-        tracking = init_tracking(project_root)
-
-    tracking["failed"][class_name] = reason
-
-    if class_name in tracking["pending"]:
-        tracking["pending"].remove(class_name)
-
-    save_tracking(project_root, tracking)
-    print(f"Marked {class_name} as failed: {reason}")
-
-
-def mark_pending(project_root: str, class_names: List[str]) -> None:
-    """Mark classes as pending (needing tests)."""
-    tracking = load_tracking(project_root)
-    if not tracking:
-        tracking = init_tracking(project_root)
-
-    for cls in class_names:
-        if cls not in tracking["pending"] and cls not in tracking["generated"]:
-            tracking["pending"].append(cls)
-
-        # Remove from failed if present
-        if cls in tracking.get("failed", {}):
-            del tracking["failed"][cls]
-
-    save_tracking(project_root, tracking)
-    print(f"Added {len(class_names)} class(es) to pending")
-
-
-def reset_tracking(project_root: str, what: str = "all") -> None:
-    """Reset tracking data."""
-    tracking = load_tracking(project_root)
-    if not tracking:
-        print("No tracking file to reset")
-        return
-
-    if what == "all":
-        tracking = init_tracking(project_root)
-        print("Reset all tracking data")
-    elif what == "failed":
-        # Move failed back to pending
-        failed = tracking.get("failed", {})
-        tracking["pending"].extend(failed.keys())
-        tracking["failed"] = {}
-        save_tracking(project_root, tracking)
-        print(f"Reset {len(failed)} failed classes to pending")
-    elif what == "pending":
-        tracking["pending"] = []
-        save_tracking(project_root, tracking)
-        print("Cleared pending list")
-    else:
-        print(f"Unknown reset target: {what}")
-
-
-def get_next_batch(project_root: str, batch_size: int = 5) -> List[str]:
-    """Get next batch of classes to process."""
-    tracking = load_tracking(project_root)
-    if not tracking:
-        return []
-
-    pending = tracking.get("pending", [])
-    return pending[:batch_size]
-
-
-def export_report(project_root: str, output_file: str = None) -> None:
-    """Export tracking data as report."""
-    tracking = load_tracking(project_root)
-    if not tracking:
-        print("No tracking data to export")
-        return
-
-    report = {
-        "generatedAt": datetime.now().isoformat(),
-        "summary": {
-            "generated": len(tracking.get("generated", [])),
-            "pending": len(tracking.get("pending", [])),
-            "failed": len(tracking.get("failed", {}))
-        },
-        "generatedClasses": tracking.get("generated", []),
-        "pendingClasses": tracking.get("pending", []),
-        "failedClasses": tracking.get("failed", {})
-    }
-
-    if output_file:
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2)
-        print(f"Report exported to {output_file}")
-    else:
-        print(json.dumps(report, indent=2))
-
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Manage JUnit test generation tracking"
-    )
-    parser.add_argument(
-        "command",
-        choices=["status", "mark-generated", "mark-failed", "mark-pending",
-                 "reset", "next-batch", "export"],
-        help="Command to execute"
-    )
-    parser.add_argument(
-        "--project-root",
-        default=".",
-        help="Project root directory"
-    )
-    parser.add_argument(
-        "--classes",
-        nargs="+",
-        help="Class names (for mark commands)"
-    )
-    parser.add_argument(
-        "--reason",
-        help="Failure reason (for mark-failed)"
-    )
-    parser.add_argument(
-        "--reset-target",
-        choices=["all", "failed", "pending"],
-        default="all",
-        help="What to reset"
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=5,
-        help="Batch size for next-batch command"
-    )
-    parser.add_argument(
-        "--output",
-        help="Output file for export"
-    )
+    if len(sys.argv) < 2:
+        print(__doc__, file=sys.stderr)
+        sys.exit(1)
 
-    args = parser.parse_args()
+    command     = sys.argv[1]
+    project_root = "."
+    scan_file   = None
+    source_folder = "src/main/java"
+    test_folder   = "src/test/java"
+    batch_size  = 5
+    reset_target = "all"
+    reason      = ""
+    coverage    = ""
 
-    if args.command == "status":
-        show_status(args.project_root)
+    # Positional args for 'mark': class name and status follow command directly
+    mark_class_name = None
+    mark_status     = None
 
-    elif args.command == "mark-generated":
-        if not args.classes:
-            print("Error: --classes required for mark-generated")
+    raw_args = sys.argv[2:]
+    i = 0
+    positional = []
+    while i < len(raw_args):
+        a = raw_args[i]
+        if   a == "--project-root":  project_root  = raw_args[i + 1]; i += 2
+        elif a == "--scan-file":     scan_file     = raw_args[i + 1]; i += 2
+        elif a == "--source-folder": source_folder = raw_args[i + 1]; i += 2
+        elif a == "--test-folder":   test_folder   = raw_args[i + 1]; i += 2
+        elif a == "--batch":         batch_size    = int(raw_args[i + 1]); i += 2
+        elif a == "--target":        reset_target  = raw_args[i + 1]; i += 2
+        elif a == "--reason":        reason        = raw_args[i + 1]; i += 2
+        elif a == "--coverage":      coverage      = raw_args[i + 1]; i += 2
+        elif not a.startswith("--"): positional.append(a); i += 1
+        else: i += 1
+
+    if command == "mark":
+        if len(positional) < 2:
+            print("Usage: tracking.py mark <class_name> <status> [--reason <text>]",
+                  file=sys.stderr)
             sys.exit(1)
-        mark_generated(args.project_root, args.classes)
+        mark_class_name = positional[0]
+        mark_status     = positional[1]
 
-    elif args.command == "mark-failed":
-        if not args.classes or len(args.classes) != 1:
-            print("Error: exactly one class required for mark-failed")
-            sys.exit(1)
-        reason = args.reason or "Unknown error"
-        mark_failed(args.project_root, args.classes[0], reason)
+    progress_path = Path(project_root) / PROGRESS_FILE
 
-    elif args.command == "mark-pending":
-        if not args.classes:
-            print("Error: --classes required for mark-pending")
-            sys.exit(1)
-        mark_pending(args.project_root, args.classes)
-
-    elif args.command == "reset":
-        reset_tracking(args.project_root, args.reset_target)
-
-    elif args.command == "next-batch":
-        batch = get_next_batch(args.project_root, args.batch_size)
-        if batch:
-            print(json.dumps(batch))
+    if   command == "status": show_status(progress_path)
+    elif command == "init":   init_progress(progress_path, project_root,
+                                            source_folder, test_folder, scan_file)
+    elif command == "mark":   mark_class(progress_path, mark_class_name,
+                                         mark_status, reason, coverage)
+    elif command == "next":   next_batch(progress_path, batch_size)
+    elif command == "reset":  reset_progress(progress_path, reset_target)
+    elif command == "export":
+        if progress_path.exists():
+            print(progress_path.read_text(encoding="utf-8"))
         else:
-            print("[]")
+            print("{}", file=sys.stderr); sys.exit(1)
+    else:
+        print(f"Unknown command: {command}", file=sys.stderr)
+        sys.exit(1)
 
-    elif args.command == "export":
-        export_report(args.project_root, args.output)
+
+# ---------------------------------------------------------------------------
+# File I/O
+# ---------------------------------------------------------------------------
+
+def load_progress(path: Path) -> dict:
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_progress(path: Path, data: dict):
+    data["lastUpdatedAt"] = datetime.now(timezone.utc).isoformat()
+    try:
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(f"Warning: Could not save {path}: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def show_status(progress_path: Path):
+    data = load_progress(progress_path)
+    if not data:
+        print(f"No {PROGRESS_FILE} found. Run 'tracking.py init' first.")
+        return
+
+    files = data.get("files", {})
+    icons = {
+        "completed":           "✅",
+        "in_progress":         "🔄",
+        "pending":             "⏳",
+        "failed":              "❌",
+        "needs_manual_review": "⚠️ ",
+    }
+
+    print(f"\nProject: {data.get('projectRoot', '.')}")
+    print(f"Scanned: {data.get('scannedAt', 'N/A')}")
+    print(f"Updated: {data.get('lastUpdatedAt', 'N/A')}")
+
+    if not files:
+        print("\nNo classes tracked yet.")
+        return
+
+    col = max((len(k) for k in files), default=40)
+    col = max(col, 40)
+    print()
+    print(f"{'Class':<{col}}  {'Status':<24}  {'Ret':>3}  {'Line%':>6}  {'Branch%':>7}  Last Error")
+    print("-" * (col + 60))
+
+    counts: dict[str, int] = {}
+    for class_name, info in files.items():
+        status  = info.get("status", "pending")
+        counts[status] = counts.get(status, 0) + 1
+        icon    = icons.get(status, "  ")
+        retries = info.get("retryCount", 0)
+        line_cov   = info.get("lineCoverage",   "—")
+        branch_cov = info.get("branchCoverage", "—")
+        history = info.get("errorHistory", [])
+        last_err = (history[-1].get("errorSummary", "")[:38] + "…"
+                    if history and len(history[-1].get("errorSummary", "")) > 38
+                    else history[-1].get("errorSummary", "—") if history else "—")
+        print(f"{class_name:<{col}}  {icon} {status:<22}  {retries:>3}  {line_cov:>6}  {branch_cov:>7}  {last_err}")
+
+    print()
+    parts = [f"{v} {k}" for k, v in counts.items() if v > 0]
+    print("Summary: " + " | ".join(parts))
+    total = len(files)
+    done  = counts.get("completed", 0)
+    if total:
+        print(f"Progress: {done}/{total} ({done * 100 // total}%)")
+
+
+def init_progress(progress_path: Path, project_root: str,
+                  source_folder: str, test_folder: str, scan_file: str | None):
+    """Initialise .junit-progress.json from scan_project.py JSON output."""
+    if scan_file:
+        raw = Path(scan_file).read_text(encoding="utf-8")
+    else:
+        raw = sys.stdin.read()
+
+    scan_data = json.loads(raw)
+
+    # Preserve already-completed entries from an existing progress file
+    existing       = load_progress(progress_path)
+    existing_files = existing.get("files", {})
+
+    files: dict[str, dict] = {}
+    for cls in scan_data.get("classes", []):
+        fqn = cls["fullClassName"]
+        # Keep completed entries intact
+        if fqn in existing_files and existing_files[fqn].get("status") == "completed":
+            files[fqn] = existing_files[fqn]
+            continue
+        # Treat classes that already have a test file as completed stubs
+        initial_status = "completed" if cls.get("testFileExists") else "pending"
+        files[fqn] = {
+            "sourceFile":    cls.get("filePath", ""),
+            "testFile":      cls.get("testFile",  ""),
+            "status":        initial_status,
+            "retryCount":    0,
+            "errorHistory":  [],
+            "startedAt":     None,
+            "completedAt":   None,
+        }
+
+    data = {
+        "projectRoot":  project_root,
+        "sourceFolder": scan_data.get("sourceFolder", source_folder),
+        "testFolder":   scan_data.get("testFolder",   test_folder),
+        "scannedAt":    scan_data.get("scannedAt",    datetime.now(timezone.utc).isoformat()),
+        "files":        files,
+    }
+    save_progress(progress_path, data)
+
+    total   = len(files)
+    pending = sum(1 for f in files.values() if f["status"] == "pending")
+    done    = sum(1 for f in files.values() if f["status"] == "completed")
+    print(f"Initialized {PROGRESS_FILE}: {total} classes, {pending} pending, {done} with existing tests.")
+
+
+def mark_class(progress_path: Path, class_name: str, status: str,
+               reason: str = "", coverage: str = ""):
+    data = load_progress(progress_path)
+    if not data:
+        print(f"Error: {PROGRESS_FILE} not found. Run 'tracking.py init' first.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    files = data.get("files", {})
+
+    # Exact match first, then suffix/substring match
+    if class_name in files:
+        match_key = class_name
+    else:
+        candidates = [k for k in files if k.endswith(class_name) or class_name in k]
+        if len(candidates) == 1:
+            match_key = candidates[0]
+        elif len(candidates) > 1:
+            print(f"Ambiguous class name '{class_name}'. Matches: {candidates}", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print(f"Class '{class_name}' not found in {PROGRESS_FILE}.", file=sys.stderr)
+            sys.exit(1)
+
+    entry     = files[match_key]
+    old_status = entry.get("status", "pending")
+    entry["status"] = status
+    now = datetime.now(timezone.utc).isoformat()
+
+    if status == "in_progress" and not entry.get("startedAt"):
+        entry["startedAt"] = now
+    elif status == "completed":
+        entry["completedAt"] = now
+        if coverage:
+            parts = coverage.split(":")
+            entry["lineCoverage"]   = parts[0] if len(parts) > 0 else ""
+            entry["branchCoverage"] = parts[1] if len(parts) > 1 else ""
+    elif status in ("failed", "needs_manual_review") and reason:
+        entry["retryCount"] = entry.get("retryCount", 0) + 1
+        entry.setdefault("errorHistory", []).append({
+            "attempt":      entry["retryCount"],
+            "timestamp":    now,
+            "errorSummary": reason[:500],
+        })
+
+    save_progress(progress_path, data)
+    print(f"Marked {match_key}: {old_status} → {status}")
+
+
+def next_batch(progress_path: Path, batch_size: int):
+    """Print the next in_progress then pending class names as a JSON array."""
+    data  = load_progress(progress_path)
+    files = data.get("files", {})
+    # in_progress first (resume interrupted work), then pending
+    result = [k for k, v in files.items() if v.get("status") == "in_progress"]
+    result += [k for k, v in files.items() if v.get("status") == "pending"]
+    print(json.dumps(result[:batch_size], indent=2))
+
+
+def reset_progress(progress_path: Path, target: str):
+    data = load_progress(progress_path)
+    if not data:
+        print("No tracking file to reset.")
+        return
+
+    files = data.get("files", {})
+    count = 0
+    for info in files.values():
+        status = info.get("status", "pending")
+        should_reset = (
+            target == "all"
+            or (target == "failed"      and status in ("failed", "needs_manual_review"))
+            or (target == "in_progress" and status == "in_progress")
+        )
+        if should_reset:
+            info.update({
+                "status":       "pending",
+                "retryCount":   0,
+                "errorHistory": [],
+                "startedAt":    None,
+                "completedAt":  None,
+            })
+            count += 1
+
+    save_progress(progress_path, data)
+    print(f"Reset {count} class(es) to pending (target: {target})")
 
 
 if __name__ == "__main__":

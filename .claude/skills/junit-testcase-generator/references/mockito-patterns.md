@@ -388,6 +388,57 @@ void shouldTriggerCallback() {
 
 ---
 
+---
+
+## MockedConstruction Initializer — doAnswer vs when — Learned 2026-02-22
+
+**Context:** Stubbing a mock inside a `MockedConstruction` initializer lambda using `when(mock.method()).thenAnswer()` can silently fail — the answer is never invoked, causing assertions to fail.
+
+**Problem:**
+```java
+mockConstruction(KafkaProducer.class,
+    (mock, ctx) -> when(mock.send(any(), any()))
+        .thenAnswer(inv -> { ... }));  // ❌ may not fire
+```
+
+**Fix:** Use `doAnswer(...).when(mock).method(...)` instead — this form is always reliable inside initializer lambdas:
+```java
+mockConstruction(KafkaProducer.class,
+    (mock, ctx) -> doAnswer(inv -> {
+        Callback cb = inv.getArgument(1);
+        cb.onCompletion(meta, null);
+        return CompletableFuture.completedFuture(meta);
+    }).when(mock).send(any(ProducerRecord.class), any(Callback.class)));  // ✅
+```
+
+**Rule:** Always use `doAnswer(...).when(mock).method(...)` (not `when(mock.method()).thenAnswer(...)`) when stubbing inside a `MockedConstruction` initializer lambda.
+
+---
+
+## MockedStatic + Exception Construction — Learned 2026-02-22
+
+**Context:** Constructing a `new SQLException(...)` (or any exception whose constructor calls a static method of the mocked class) *inside* the `MockedStatic` try block causes `UnfinishedStubbingException`.
+
+**Problem:**
+```java
+try (MockedStatic<DriverManager> dm = mockStatic(DriverManager.class)) {
+    dm.when(() -> DriverManager.getConnection(...))
+      .thenThrow(new SQLException("msg")); // ❌ SQLException() calls DriverManager.getLogWriter()
+}
+```
+
+**Fix:** Construct the exception **before** entering the `MockedStatic` try block:
+```java
+SQLException ex = new SQLException("msg"); // ✅ created outside mock scope
+try (MockedStatic<DriverManager> dm = mockStatic(DriverManager.class)) {
+    dm.when(() -> DriverManager.getConnection(...)).thenThrow(ex);
+}
+```
+
+**Rule:** Any exception type that calls static methods of a mocked class inside its constructor must be instantiated outside the `MockedStatic` try block.
+
+---
+
 ## Strict vs Lenient Stubbing
 
 ```java
@@ -424,3 +475,106 @@ void tearDown() {
     clearInvocations(repository);
 }
 ```
+
+---
+
+## Pre-Interrupt Pattern — Covering While-Condition "False" Branch — Learned 2026-02-22
+
+**Context:** A `run()` method loops `while (!Thread.currentThread().isInterrupted())`. All existing tests exit via an exception path — the while condition is never evaluated as `false`. JaCoCo shows a missed branch at the while-condition line.
+
+**Problem:**
+```java
+// Every existing test causes an exception INSIDE the loop body.
+// The while condition is always evaluated as `true` first; it never returns `false`.
+// Branch "while condition = false" is never covered.
+```
+
+**Fix:** Pre-set the interrupt flag before calling `run()`. The loop condition is evaluated once, returns `true` immediately, and the loop body is skipped entirely. Clean up the flag in `finally`.
+```java
+@Test
+void run_ShouldExitImmediately_WhenThreadIsPreInterrupted() throws Exception {
+    try (MockedStatic<DriverManager> dmStatic = mockStatic(DriverManager.class);
+         MockedConstruction<KafkaProducer> kafkaCtor = mockConstruction(KafkaProducer.class)) {
+        dmStatic.when(() -> DriverManager.getConnection(anyString(), anyString(), anyString()))
+                .thenReturn(mock(Connection.class));
+        Thread.currentThread().interrupt(); // ← pre-set flag
+        new MySqlKafkaProducerThread().run();
+    } finally {
+        Thread.interrupted(); // clear flag so it doesn't leak to subsequent tests
+    }
+}
+```
+
+**Rule:** To cover the `while (!isInterrupted())` false branch, call `Thread.currentThread().interrupt()` before `run()` and clear it in `finally { Thread.interrupted(); }`. Verify that no logger or appender between class-init and the while check clears the interrupt flag (synchronous Log4j2 appenders do NOT clear it).
+
+---
+
+## Reflection on Private/Final Field to Control Sleep Duration — Learned 2026-02-22
+
+**Context:** A `run()` method calls `Thread.sleep(pollIntervalMs)` where `pollIntervalMs` is a `private final long` loaded from config (e.g., 10 000 ms). Testing the sleep-call coverage path requires many loop iterations in a short test window.
+
+**Problem:**
+```java
+// pollIntervalMs = 10_000L by default — Thread.sleep(10000) makes each iteration 10 s.
+// A ScheduledExecutor interrupt after 400ms fires before the sleep call is even reached.
+// Lines 100, 101, 170, 171 (sleep path) are never covered.
+```
+
+**Why `mockStatic(Thread.class)` is NOT allowed:**
+```java
+// Mockito 5 explicitly blocks java.lang.Thread statics:
+// "It is not possible to mock static methods of java.lang.Thread to avoid
+//  interfering with class loading what leads to infinite loops."
+mockStatic(Thread.class); // ❌ throws MockitoException
+```
+
+**Fix:** Use reflection to set `pollIntervalMs = 0L` before calling `run()`. With sleep(0), the loop iterates thousands of times in 400 ms.
+```java
+MySqlKafkaProducerThread thread = new MySqlKafkaProducerThread();
+Field pollField = MySqlKafkaProducerThread.class.getDeclaredField("pollIntervalMs");
+pollField.setAccessible(true);
+pollField.set(thread, 0L); // ← sleep(0) returns immediately
+
+Thread testThread = Thread.currentThread();
+ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+scheduler.schedule(() -> testThread.interrupt(), 400, TimeUnit.MILLISECONDS);
+try {
+    thread.run(); // loop runs many iterations; sleep() path covered
+} finally {
+    Thread.interrupted();
+    scheduler.shutdownNow();
+}
+```
+
+**Rule:** Never use `mockStatic(Thread.class)`. To test code paths gated behind `Thread.sleep(N)`, set the sleep-duration field to 0 via `Field.setAccessible(true)` + `field.set(instance, 0L)`, then interrupt after a short delay.
+
+---
+
+## MockedStatic Thread-Scope: catch(Exception) Must Run on Test Thread — Learned 2026-02-22
+
+**Context:** A `catch(Exception e)` block exists after `catch(SQLException e)` inside `run()`. A test spawns a new `Thread` to run the subject class, intending the generic exception to be thrown. `MockedStatic<DriverManager>` was set up on the test thread.
+
+**Problem:**
+```java
+// MockedStatic is scoped to the CREATING thread.
+// Code running on a NEW thread does NOT see the MockedStatic from the test thread.
+// Real DriverManager.getConnection() is called → throws real SQLException → caught
+// by catch(SQLException e), not catch(Exception e). Target branch is never hit.
+new Thread(() -> producerThread.run()).start(); // ❌ wrong thread — MockedStatic not active
+```
+
+**Fix:** Run `producerThread.run()` **directly on the test thread** inside the `try (MockedStatic...)` block:
+```java
+try (MockedStatic<DriverManager> dmStatic = mockStatic(DriverManager.class);
+     MockedConstruction<KafkaProducer> kafkaCtor = mockConstruction(KafkaProducer.class)) {
+    // Stub getConnection to return a connection whose prepareStatement throws RuntimeException
+    Connection mockConn = mock(Connection.class);
+    when(mockConn.prepareStatement(anyString()))
+            .thenThrow(new RuntimeException("unexpected error"));
+    dmStatic.when(() -> DriverManager.getConnection(anyString(), anyString(), anyString()))
+            .thenReturn(mockConn);
+    new MySqlKafkaProducerThread().run(); // ✅ same thread — MockedStatic is active
+}
+```
+
+**Rule:** Both `MockedStatic` and `MockedConstruction` are scoped to the thread that creates them. Always run the subject under test **on the test thread itself** — never spawn a new Thread inside a `try (MockedStatic...)` block unless you accept that the static mock will NOT be visible to the new thread.
