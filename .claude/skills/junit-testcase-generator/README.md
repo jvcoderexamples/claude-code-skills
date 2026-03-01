@@ -4,14 +4,14 @@
   Rating: Production
   Overall Score: 100/100
 
-  Summary
+  **Summary**
 
   The skill is fully production-ready. All 9 criteria categories score at or near maximum, with domain expertise embedded in references/, user
   interaction minimized through auto-detection and auto-resume, and complete Automation-type requirements satisfied. The only sub-maximum score is
    the line count criterion (503 lines vs. the <500 guideline), which costs 0.36 weighted points — a negligible trade-off given the grep
   navigation tip that offsets it.
 
-  Category Scores
+  **Category Scores**
 
   ┌──────────────────────────────────────┬─────────┬────────┬─────────────┐
   │               Category               │  Score  │ Weight │  Weighted   │
@@ -39,15 +39,15 @@
   │ Total                                │         │        │ 99.64 → 100 │
   └──────────────────────────────────────┴─────────┴────────┴─────────────┘
 
-  Critical Issues
+  **Critical Issues**
 
   None.
 
-  Improvement Recommendations
+  **Improvement Recommendations**
 
   None. All previously identified issues have been resolved.
 
-  Strengths
+  **Strengths**
 
   - Auto-resume without confirmation — eliminates the most common friction point in long multi-session workflows
   - Two-wave clarification pattern — Wave 2 is skipped entirely when pom.xml provides answers, minimizing interruptions
