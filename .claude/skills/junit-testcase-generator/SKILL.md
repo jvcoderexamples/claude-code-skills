@@ -6,27 +6,27 @@ description: |
   conditional paths including logger guard checks (isDebugEnabled, isInfoEnabled).
   Mocks database calls, API calls, Kafka read/writes, and loggers.
   Traverses source folders, generates tests for all classes including private/static methods,
-  verifies each test class with Maven (mvn test -Dtest=<ClassName>Test), auto-fixes errors
-  up to 3 retries, and persists progress in .junit-progress.json for cross-session resume.
+  verifies each test class with Maven (mvn test -Dtest=<ClassName>Test) and JaCoCo coverage,
+  auto-fixes errors up to 3 retries, and persists progress in junit-test-cases-coverage.json
+  for automatic cross-session resume.
   This skill should be used when users need to generate unit tests for Java projects,
   create test coverage for legacy code, or automate test case creation across multiple classes.
 ---
 
 # JUnit Test Case Generator
 
-Automated JUnit 5 + Mockito test generation for Maven projects targeting **100% branch coverage** with per-class Maven verification and cross-session progress tracking.
+Automated JUnit 5 + Mockito test generation for Maven projects targeting **100% branch coverage** with per-class Maven + JaCoCo verification and automatic cross-session resume.
 
 ## What This Skill Does
 
-- Scans Java source folders and builds a complete file inventory with per-file status tracking
-- Persists progress in `.junit-progress.json` inside the project — survives session restarts
-- On resume: shows a progress summary table and asks user to confirm before continuing
-- Generates JUnit 5 test cases with Mockito mocking framework
+- **Plans first** — scans Java source folders, builds a complete inventory, and saves it to `junit-test-cases-coverage.json` before generating any tests
+- Persists progress in `junit-test-cases-coverage.json` inside the project root — survives session restarts with **automatic resume** (no confirmation needed)
+- Generates JUnit 5 test cases with Mockito mocking framework, one class at a time
 - **Targets 100% branch coverage** — every if/else, switch case, try/catch, ternary, and conditional path
 - **Mocks infrastructure** — database calls, API calls, Kafka producer/consumer, loggers
 - **Tests logger guards** — `logger.isDebugEnabled()` and `logger.isInfoEnabled()` both true AND false paths
 - Tests private methods (via reflection) and static methods (via MockedStatic)
-- Verifies each generated test with `mvn test -Dtest=<ClassNameTest>` and auto-fixes errors
+- Validates each generated test with `mvn test -Dtest=<ClassNameTest>` (syntax + pass) **and** checks JaCoCo branch/instruction coverage
 - Retries up to **3 times** per file; marks as `needs_manual_review` after 3 failed attempts
 - Tracks error history per file so each retry benefits from previous failure context
 
@@ -38,59 +38,60 @@ Automated JUnit 5 + Mockito test generation for Maven projects targeting **100% 
 
 ---
 
+## Allowed Commands (No Permission Prompts Required)
+
+The following shell commands **must run without asking for user permission**:
+
+| Command | Purpose |
+|---------|---------|
+| `cd` | Change working directory |
+| `ls` | List directory contents |
+| `find` | Find files by pattern |
+| `grep` | Search file contents |
+| `tail` | Read end of files (e.g., Maven output) |
+| `mvn` | Run Maven goals (compile, test, verify) |
+
+All other tool calls (Edit, Write, Bash for other commands) follow normal permission rules.
+
+> **Note**: The `scripts/` directory contains Python and Java equivalents for file scanning (`scan_project`), progress tracking (`tracking`), and Maven output parsing (`verify_tests`). Requires **Python ≥ 3.8** or **Java 11+**. They are retained as an alternative for users who prefer scripted operation, but the default workflow uses direct shell commands above.
+
+---
+
 ## Quick Start
 
 ```
 User: Generate JUnit tests for src/main/java
-```
-
-or, to resume a previous session:
-
-```
 User: Resume JUnit test case generation
 ```
 
-The skill will:
-1. **Check for `.junit-progress.json`** in the project root
-2. If found → show progress summary and ask to confirm resume
-3. If not found → ask clarifying questions, then scan and initialize tracking
-4. Generate tests for each pending class covering **all branches**
-5. Verify each class with `mvn test -Dtest=<ClassNameTest>`, fix errors (up to 3 retries)
-6. Mark verified classes as `completed`; mark unresolvable classes as `needs_manual_review`
-7. Update `.junit-progress.json` after every file
+On every invocation: check for `junit-test-cases-coverage.json` → auto-resume if found, otherwise ask 2 clarifying questions → scan → generate → verify (Maven + JaCoCo) → update JSON. See Step 0 below for the full decision tree.
 
 ---
 
 ## Step 0: New Session vs. Resume Detection (MANDATORY FIRST STEP)
 
-**Before anything else**, check for `.junit-progress.json` in the project root:
+**Before anything else**, check for `junit-test-cases-coverage.json` in the project root:
 
-### If `.junit-progress.json` EXISTS → Resume Flow
-
-1. Read the file and display a progress summary table:
-
-```
-┌─────────────────────────────────────────────┬───────────────────────┬────────┬────────────┐
-│ Class (fully-qualified)                     │ Status                │Retries │ Last Error │
-├─────────────────────────────────────────────┼───────────────────────┼────────┼────────────┤
-│ com.example.UserService                     │ ✅ completed           │   0    │ —          │
-│ com.example.OrderService                    │ ✅ completed           │   1    │ —          │
-│ com.example.PaymentService                  │ 🔄 in_progress        │   1    │ NPE in ... │
-│ com.example.NotificationService             │ ⏳ pending             │   0    │ —          │
-│ com.example.BrokenUtil                      │ ⚠️  needs_manual_review│   3    │ cannot ... │
-└─────────────────────────────────────────────┴───────────────────────┴────────┴────────────┘
-
-Summary: 2 completed | 1 in_progress | 1 pending | 1 needs_manual_review
+```bash
+# Run without asking permission:
+ls junit-test-cases-coverage.json 2>/dev/null && echo "EXISTS" || echo "NOT_FOUND"
 ```
 
-2. Ask the user:
-   - "Continue from where we left off?" → resume from first `in_progress` or `pending` file
-   - "Start a specific file?" → let user choose a class name to jump to
-   - "Reset and start fresh?" → delete `.junit-progress.json` and re-scan
+### If `junit-test-cases-coverage.json` EXISTS → Auto-Resume Flow
 
-Do NOT proceed without user confirmation.
+1. Read the file silently.
+2. Display a concise progress summary:
 
-### If `.junit-progress.json` does NOT exist → Fresh Start Flow
+```
+📋 Resuming junit-test-cases-coverage.json
+   ✅ completed: 12  |  🔄 in_progress: 1  |  ⏳ pending: 8  |  ⚠️  needs_manual_review: 0
+
+Resuming from: com.example.PaymentService
+```
+
+3. **Immediately begin processing** the first `in_progress` file, or the first `pending` file if none are `in_progress`. Do NOT ask the user for confirmation.
+
+### If `junit-test-cases-coverage.json` does NOT exist → Fresh Start Flow
 
 Go to **Step 1: Ask Clarifying Questions**.
 
@@ -111,7 +112,7 @@ If the user does not answer a question, apply the stated default and proceed.
 
 ### Wave 2 — Optional (ask only if not auto-detectable)
 
-Before sending Wave 2, **scan pom.xml and `src/test/java`** to infer answers:
+Before sending Wave 2, **scan pom.xml and `src/test/java`** to infer answers (use `grep` — no permission needed):
 
 - **Logger framework** — check pom.xml for `slf4j`, `log4j`, `logback` deps → skip if found
 - **Kafka usage** — check pom.xml for `spring-kafka` or `kafka-clients` → skip if found
@@ -133,197 +134,187 @@ If the user does not answer, apply the stated default and proceed.
 
 ## Before Implementation
 
-Gather context to ensure successful implementation:
+Gather context before generating any tests:
 
 | Source | Gather |
 |--------|--------|
-| **Codebase** | Project structure, existing test patterns, pom.xml, logger framework, Kafka/DB usage |
-| **Conversation** | Source folder path, exclusions, specific classes to prioritize |
-| **Skill References** | JUnit 5 patterns, Mockito, infrastructure mocking, branch coverage from `references/` |
-| **User Guidelines** | Team naming conventions, test organization preferences |
+| **Codebase** | pom.xml deps (logger/Kafka/DB/HTTP framework), existing test structure in `src/test/java` |
+| **Conversation** | Source folder path, exclusion patterns, priority classes |
+| **Skill References** | `references/branch-coverage.md` — read for every class; `references/infrastructure-mocking.md` — read when DB/API/Kafka/Logger detected |
+| **User Guidelines** | Team naming conventions, test organization preferences from CLAUDE.md if present |
 
 ---
 
-## Tool-Assisted Operations (Use Scripts — Not LLM — for These)
+## Phase 1: Plan — Initialize `junit-test-cases-coverage.json`
 
-The `scripts/` directory contains Python and Java scripts for all deterministic operations. **Always use scripts instead of LLM reasoning** for: file scanning, progress tracking, and Maven output parsing.
+**This phase runs once, before any test generation begins.**
 
-### Runtime Detection (Run Once at Session Start)
+### 1.1 Scan Source Files
 
-Detect which runtime is available and store the result for the entire session:
+Use `find` (no permission needed) to discover all Java source files:
 
 ```bash
-# Prefer python3; fall back to Java
-python3 --version 2>&1 && echo "RUNTIME=python" || echo "RUNTIME=java"
-java --version 2>&1  # fallback check
+# Find all Java source files, excluding interfaces and generated code
+find <source_folder> -name "*.java" -not -name "package-info.java" -not -name "module-info.java" | sort
 ```
 
-Set `SKILL_DIR` to the skill's base directory (shown in the "Base directory for this skill:" header).
+For each discovered file, determine:
+- **className** — simple class name (e.g., `UserService`)
+- **fqn** — fully qualified name (e.g., `com.example.UserService`)
+- **testFile** — expected test file path (e.g., `src/test/java/com/example/UserServiceTest.java`)
+- **hasExistingTest** — whether the test file already exists (`ls` to check)
+- **isInterface** — skip interfaces (`grep -l "^public interface\|^\s*interface " <file>`)
+- **status** — `completed` if test file exists and was previously tracked; `pending` otherwise
 
-### Script Reference Table
+### 1.2 Create `junit-test-cases-coverage.json`
 
-| Operation | Python | Java | When to Use |
-|-----------|--------|------|-------------|
-| Scan source files | `python3 {SKILL_DIR}/scripts/scan_project.py` | `java --source 11 {SKILL_DIR}/scripts/ScanProject.java` | Phase 1: build class inventory |
-| Manage progress file | `python3 {SKILL_DIR}/scripts/tracking.py` | `java --source 11 {SKILL_DIR}/scripts/Tracking.java` | After every status change |
-| Verify test class | `python3 {SKILL_DIR}/scripts/verify_tests.py` | `java --source 11 {SKILL_DIR}/scripts/VerifyTests.java` | Phase 3: after writing each test |
+Write the planning file to the project root before starting any generation:
 
-**LLM is still needed for:** reading source classes, understanding business logic, generating test code, and fixing compilation/assertion errors.
+```json
+{
+  "lastUpdated": "<ISO-8601-timestamp>",
+  "sourceFolder": "src/main/java",
+  "totalClasses": <N>,
+  "processedClasses": 0,
+  "summary": {
+    "totalCompleted": 0,
+    "totalInProgress": 0,
+    "totalPending": <N>,
+    "totalNeedsManualReview": 0
+  },
+  "classes": [
+    {
+      "className": "UserService",
+      "fqn": "com.example.UserService",
+      "testFile": "src/test/java/com/example/UserServiceTest.java",
+      "status": "pending",
+      "branchCoverage": null,
+      "instructionsCoverage": null,
+      "retryCount": 0,
+      "lastError": null,
+      "notes": null
+    }
+  ]
+}
+```
+
+**Field definitions:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `className` | string | Simple class name |
+| `fqn` | string | Fully qualified class name |
+| `testFile` | string | Relative path to the test file |
+| `status` | enum | `pending`, `in_progress`, `completed`, `failed`, `needs_manual_review` |
+| `branchCoverage` | string\|null | JaCoCo branch coverage % (e.g., `"85%"`) — set after verification |
+| `instructionsCoverage` | string\|null | JaCoCo instruction coverage % (e.g., `"92%"`) — set after verification |
+| `retryCount` | int | Number of failed generation attempts |
+| `lastError` | string\|null | First 400 chars of the most recent error |
+| `notes` | string\|null | Optional notes about skipped classes or special handling |
+
+### 1.3 Report to User
+
+```
+📋 Plan created: junit-test-cases-coverage.json
+   Total classes found: 48
+   Already have tests:  12 (marked as in_progress for coverage verification)
+   Pending generation:  36
+
+Starting test generation...
+```
+
+### 1.4 Add Missing pom.xml Dependencies
+
+Check for and add JUnit 5, Mockito, Surefire, JaCoCo if absent. Use `grep` to check pom.xml first.
 
 ---
 
-## Workflow
-
-### Phase 1: Initialize & Scan
-
-```
-1. Verify Maven project structure (Bash — not LLM):
-   - Check pom.xml exists in project root
-
-2. Run the source scanner script:
-
-   # Python (preferred):
-   python3 {SKILL_DIR}/scripts/scan_project.py <source_folder> \
-       --test-folder <test_folder> \
-       --exclude <pattern1> --exclude <pattern2> \
-       --project-root <project_root> \
-       --output json > /tmp/scan_result.json
-
-   # Java fallback:
-   java --source 11 {SKILL_DIR}/scripts/ScanProject.java <source_folder> \
-       --test-folder <test_folder> \
-       --exclude <pattern1> \
-       --project-root <project_root> \
-       --output json > /tmp/scan_result.json
-
-   The script:
-   - Walks the source tree, skips interfaces, package-info.java, module-info.java
-   - Checks for existing test files
-   - Checks pom.xml for JUnit 5, Mockito, Surefire, JaCoCo dependencies
-   - Outputs structured JSON — no file writing, pure stdout
-
-3. Initialize .junit-progress.json from scan output:
-
-   # Python:
-   python3 {SKILL_DIR}/scripts/tracking.py init \
-       --project-root <project_root> \
-       --scan-file /tmp/scan_result.json
-
-   # Java:
-   java --source 11 {SKILL_DIR}/scripts/Tracking.java init \
-       --project-root <project_root> \
-       --scan-file /tmp/scan_result.json
-
-   This preserves any already-completed entries and creates pending entries
-   for all classes that lack a test file.
-
-4. Report to user:
-   "Scanned X Java files. Y already have tests. Proceeding with Z files."
-
-5. Add missing pom.xml dependencies (JUnit 5, Mockito, Surefire, JaCoCo) if
-   the scan reported them absent. (LLM step — edit pom.xml.)
-```
-
-**Status values for each file:**
-
-| Status | Meaning |
-|--------|---------|
-| `pending` | Not yet started |
-| `in_progress` | Generation started but not verified |
-| `completed` | Generated + Maven verified + all tests pass |
-| `failed` | Current retry attempt failed, will be retried |
-| `needs_manual_review` | 3 retries exhausted, cannot auto-fix |
-
-### Phase 2: Iterative Generation (100% Branch Coverage)
+## Phase 2: Generate — One Class at a Time
 
 Process files in this order:
 1. `in_progress` files first (incomplete from prior session)
 2. `pending` files in scan order
 3. Skip `completed` and `needs_manual_review` files
 
-For EACH file:
+For **EACH** file:
 
 ```
-1. Update status to "in_progress" in .junit-progress.json
-2. Update "startedAt" timestamp
+1. Update status to "in_progress" in junit-test-cases-coverage.json
+   (Write tool — direct JSON edit)
 
-3. Read the source class thoroughly
-4. Map ALL branches in the class:
-   - Every if/else (including single-if without else)
-   - Every switch case + default
-   - Every try/catch/finally block
-   - Every ternary operator (both true and false)
-   - Every Optional.isPresent()/isEmpty() path
-   - Every early return / guard clause
-   - Every loop (zero iterations + one+ iterations)
-   - Every logger.isDebugEnabled() / logger.isInfoEnabled() (true AND false)
+2. Read the source class thoroughly (Read tool)
 
-5. Analyze dependencies and mock strategy:
-   - Public methods → Standard JUnit tests
-   - Private methods → Reflection-based tests
-   - Static methods → MockedStatic tests
-   - Database calls (JPA, JDBC) → Mock repositories/datasources
-   - API calls (RestTemplate, WebClient, Feign) → Mock HTTP clients
-   - Kafka (KafkaTemplate, KafkaProducer, @KafkaListener) → Mock Kafka components
-   - Loggers (SLF4J/Log4j2) → Mock Logger to test guard conditions
+3. Map ALL branches in the class — see `references/branch-coverage.md` for the full branch taxonomy
+   (if/else, switch, try/catch, ternary, Optional, guard clauses, loops, logger guards).
 
-6. If retryCount > 0: review errorHistory entries before generating
+4. Analyze dependencies and mock strategy — see `references/infrastructure-mocking.md` for patterns.
+   Summary: public → JUnit, private → reflection, static → MockedStatic, DB/HTTP/Kafka/Logger → mock.
+
+5. If retryCount > 0: review lastError before generating
    - Avoid repeating the same mistakes
    - Apply targeted fixes based on previous error messages
 
-7. Generate test class following patterns in references/
+6. Generate test class following patterns in references/
    - See references/infrastructure-mocking.md for DB, API, Kafka, Logger patterns
    - See references/branch-coverage.md for all-branches coverage patterns
 
-8. Write test file to test directory
-9. Proceed to Phase 3 (Verification)
+7. Write test file to test directory (Write tool)
+
+8. Proceed to Phase 3 (Verification)
 ```
 
-### Phase 3: Verification & Auto-Fix (3-Retry Loop)
+---
 
-Use the verify script to run Maven and parse results — do NOT run `mvn` directly and parse output by eye.
+## Phase 3: Verify — Maven Test + JaCoCo Coverage
+
+**Both steps are required before marking a class as `completed`.**
+
+### Step 3a: Run Maven Tests
+
+```bash
+# No permission needed for mvn:
+mvn test -Dtest=<ClassNameTest> 2>&1 | tail -40
+```
+
+Parse output for:
+- `BUILD SUCCESS` → tests passed
+- `BUILD FAILURE` → compilation error or test failure
+- `Tests run: N, Failures: F, Errors: E` → test counts
+
+### Step 3b: Read JaCoCo Coverage Report
+
+After a successful Maven test run, read the JaCoCo CSV or XML report to extract coverage for the specific class:
+
+```bash
+# Check if JaCoCo report exists (CSV or XML):
+find target/site/jacoco -name "jacoco.csv" -o -name "jacoco.xml" 2>/dev/null | head -1
+```
+
+Extract **branch coverage** and **instruction coverage** for the class under test. If the JaCoCo report is not generated automatically, run:
+
+```bash
+# Use 'clean' to ensure target/jacoco.exec contains only this test's data:
+mvn clean test -Dtest=<ClassNameTest> jacoco:report 2>&1 | tail -20
+```
+
+> **Why `clean` is required**: JaCoCo's `jacoco:report` goal reads all accumulated data from `target/jacoco.exec`. Without `clean`, exec data from previous test runs accumulates, producing inflated or inaccurate per-class coverage numbers.
+
+Then read the report:
+```bash
+grep "SimpleClassName" target/site/jacoco/jacoco.csv   # or jacoco.xml
+```
+
+### Step 3c: Retry Loop (max 3 attempts)
 
 ```
 RETRY LOOP (max 3 attempts per file):
 
 Attempt 1..3:
-  a. Mark class as in_progress (script):
+  a. Run Maven tests (Step 3a)
 
-     # Python:
-     python3 {SKILL_DIR}/scripts/tracking.py mark {FullyQualifiedClassName} in_progress \
-         --project-root <project_root>
-
-     # Java:
-     java --source 11 {SKILL_DIR}/scripts/Tracking.java mark {FullyQualifiedClassName} in_progress \
-         --project-root <project_root>
-
-  b. Run verify script:
-
-     # Python:
-     python3 {SKILL_DIR}/scripts/verify_tests.py \
-         --test-class {ClassNameTest} \
-         --project-root <project_root> \
-         --output json
-
-     # Java:
-     java --source 11 {SKILL_DIR}/scripts/VerifyTests.java \
-         --test-class {ClassNameTest} \
-         --project-root <project_root> \
-         --output json
-
-     The script runs: mvn test -Dtest={ClassNameTest}
-     Parses surefire output + compilation errors into structured JSON.
-     Exit code 0 = success, 1 = failure.
-
-  c. If SUCCESS (exit code 0, "success": true):
-     - Mark completed (script):
-         tracking.py mark {FQN} completed --coverage "100%:100%"
-     - Print: "✅ {ClassName} — verified in {N} attempt(s)"
-     - Move to next file
-
-  d. If FAILURE (exit code 1):
-     - Script JSON output contains "compilationErrors" and/or "results.failures"
-     - Use LLM to read the error details and apply the fix:
+  b. If BUILD FAILURE or test failures:
+     - Read the error output carefully
+     - Apply targeted fix to the test file
 
      Fix strategy by error type:
      | Error Type                   | Fix Strategy                                      |
@@ -335,53 +326,62 @@ Attempt 1..3:
      | AssertionError               | Review expected vs actual, fix assertion          |
      | NullPointerException         | Add null checks or mock setup                     |
      | MockitoException             | Fix mock configuration                            |
-     | UnnecessaryStubbingException | Remove unused stub or switch to lenient()         |
+     | UnnecessaryStubbingException | Remove unused stub or add @MockitoSettings(LENIENT)|
 
-     - Apply fix to the test file (LLM step)
-     - Mark failed + record error (script):
-         tracking.py mark {FQN} failed \
-             --reason "<first 400 chars of error summary>" \
-             --project-root <project_root>
+     - Update retryCount + lastError in junit-test-cases-coverage.json
      - If retryCount < 3: go to next attempt
-     - If retryCount == 3: mark as needs_manual_review (script)
+     - If retryCount == 3: mark as needs_manual_review, continue to next class
+
+  c. If BUILD SUCCESS:
+     - Read JaCoCo coverage (Step 3b)
+     - Update junit-test-cases-coverage.json with branchCoverage + instructionsCoverage
+     - Mark status as "completed"
+     - Print: "✅ {ClassName} — {branchCoverage} branch / {instructionsCoverage} instruction"
+     - Move to next file
+```
 
 After 3 failed attempts:
-     tracking.py mark {FQN} needs_manual_review \
-         --reason "3 retries exhausted" --project-root <project_root>
-     Print: "⚠️  {ClassName} — 3 retries exhausted. Marked for manual review."
-     Continue to next file (do NOT block progress).
 ```
-
-### Phase 4: Progress Persistence
-
-**Use the tracking script after EVERY status change** — not just at the end.
-
-```bash
-# View current progress at any time:
-python3 {SKILL_DIR}/scripts/tracking.py status --project-root <project_root>
-
-# Get next batch of classes to process:
-python3 {SKILL_DIR}/scripts/tracking.py next --batch 5 --project-root <project_root>
-
-# Reset in_progress classes (e.g., after interrupted session):
-python3 {SKILL_DIR}/scripts/tracking.py reset --target in_progress --project-root <project_root>
+- Set status = "needs_manual_review"
+- Set lastError = "<summarized error>"
+- Print: "⚠️  {ClassName} — 3 retries exhausted. Marked for manual review."
+- Continue to next file (do NOT block progress)
 ```
-
-Key rules:
-- Call `tracking.py mark` after every status change (never batch updates)
-- Never delete `.junit-progress.json` mid-session — it is the single source of truth
-- On fresh scan: `tracking.py init` preserves existing `completed` entries automatically
-
-See `references/progress-schema.md` for the full JSON schema, field definitions, and a complete annotated example.
 
 ---
 
-## Resume Flow Notes
+## Phase 4: Update `junit-test-cases-coverage.json` After Every File
 
-When resuming (see Step 0 for the full decision tree and options):
+Update the file **immediately** after every status change — not just at the end. See `references/progress-schema.md` for full field definitions.
 
-- **"Retry `needs_manual_review` files?"** → run `tracking.py reset --target failed` then proceed normally
-- **Before resuming an `in_progress` class**, re-read its source file — it may have changed since the last session
+### Update the summary counters after every change:
+
+```json
+"summary": {
+  "totalCompleted": <count of completed>,
+  "totalInProgress": <count of in_progress>,
+  "totalPending": <count of pending>,
+  "totalNeedsManualReview": <count of needs_manual_review>
+},
+"processedClasses": <completed + needs_manual_review>,
+"lastUpdated": "<ISO-8601-timestamp>"
+```
+
+### Example completed entry:
+
+```json
+{
+  "className": "UserService",
+  "fqn": "com.example.UserService",
+  "testFile": "src/test/java/com/example/UserServiceTest.java",
+  "status": "completed",
+  "branchCoverage": "87%",
+  "instructionsCoverage": "93%",
+  "retryCount": 1,
+  "lastError": null,
+  "notes": null
+}
+```
 
 ---
 
@@ -423,6 +423,8 @@ Never do the following in generated tests:
 - **Shared mutable state between test methods** — all mocks reset between tests via `@ExtendWith(MockitoExtension.class)`; do not use `static` fields for test data
 - **Real credentials or PII in test fixtures** — use placeholder values (`"test-user"`, `"dummy-password"`) never production secrets
 - **Ignoring `UnnecessaryStubbingException`** — remove unused stubs; do not suppress by default with `LENIENT` unless the stub is conditionally needed
+- **Logging sensitive values in test output** — never print actual passwords, tokens, or PII in assertion messages or `System.out` calls within tests
+- **Instantiating abstract or final classes directly** — use a concrete inner subclass for abstract classes; use `MockedStatic` or refactor for final classes that cannot be mocked
 
 ---
 
@@ -441,7 +443,8 @@ Before marking a class as `completed`:
 - [ ] **Loggers mocked** — Logger instance mocked for guard condition testing
 - [ ] Naming follows `{MethodName}_Should{Behavior}_When{Condition}`
 - [ ] `mvn test -Dtest=<ClassNameTest>` → BUILD SUCCESS
-- [ ] `.junit-progress.json` updated with `status: completed`
+- [ ] JaCoCo coverage extracted and recorded in `junit-test-cases-coverage.json`
+- [ ] `junit-test-cases-coverage.json` updated with `status: completed`
 
 ---
 
@@ -451,17 +454,20 @@ Before marking a class as `completed`:
 |---------|---------|
 | `mvn test -Dtest=UserServiceTest` | **Primary verification** — compile + run single test class |
 | `mvn test -Dtest=UserServiceTest#methodName` | Run specific test method |
+| `mvn clean test -Dtest=UserServiceTest jacoco:report` | Run test + generate JaCoCo report (`clean` required for accurate single-class coverage) |
 | `mvn test` | Run entire test suite |
 | `mvn clean test` | Clean and run all tests |
 | `mvn test -DskipTests=false -Dmaven.test.failure.ignore=true` | Run tests, don't fail build |
+
+All `mvn` commands run **without requesting user permission**.
 
 ---
 
 ## Maven Dependencies
 
-Ensure pom.xml includes JUnit 5, Mockito Core, Mockito JUnit Jupiter, and Maven Surefire Plugin. Add if missing.
+Ensure pom.xml includes JUnit 5, Mockito Core, Mockito JUnit Jupiter, Maven Surefire Plugin, and **JaCoCo Maven Plugin**. Add if missing.
 
-See `references/maven-setup.md` for full dependency XML, plugin configuration, version freshness note, and Spring Boot compatibility guidance.
+> **Version freshness**: Verify current versions on Maven Central before adding — do not assume versions embedded in `references/maven-setup.md` are current. See that file for full dependency XML, plugin configuration, and Spring Boot compatibility guidance.
 
 ---
 
@@ -481,6 +487,8 @@ See `references/maven-setup.md` for full dependency XML, plugin configuration, v
 
 ## Reference Files
 
+> **Tip**: To locate a specific pattern quickly: `grep -n "keyword" references/<file>.md` — e.g., `grep -n "MockedStatic" references/mockito-patterns.md`
+
 | File | When to Read |
 |------|--------------|
 | `references/junit5-patterns.md` | JUnit 5 annotations, assertions, lifecycle |
@@ -489,12 +497,6 @@ See `references/maven-setup.md` for full dependency XML, plugin configuration, v
 | `references/test-design.md` | Boundary value, equivalence partitioning |
 | `references/infrastructure-mocking.md` | **Database, API, Kafka, Logger mocking** — read when class has DB/API/Kafka/Logger deps |
 | `references/branch-coverage.md` | **All-branches coverage patterns** — read for every class |
-| `references/progress-schema.md` | Full `.junit-progress.json` schema, field definitions, annotated example |
 | `references/maven-setup.md` | Dependency XML, plugin config, version freshness note, Spring Boot compatibility |
-| `references/scripts-guide.md` | Full argument reference, JSON schemas, Java/Python examples for all 3 scripts |
-
----
-
-## Scripts Reference
-
-See `references/scripts-guide.md` for full argument reference, JSON output schemas, and Java/Python command examples for all three scripts (`scan_project`, `tracking`, `verify_tests`).
+| `references/progress-schema.md` | Full `junit-test-cases-coverage.json` schema, field definitions, annotated example |
+| `references/scripts-guide.md` | Full argument reference for `scripts/` Python/Java alternatives (scan, tracking, verify) |
